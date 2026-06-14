@@ -1,0 +1,48 @@
+dataset: imagenette
+
+# Identifies this run. Bump it when you change dataset/lr/epochs to start a
+# fresh set of checkpoints under checkpoints/<cascade_id>_chkpts/; reuse it to
+# load previously saved weights.
+cascade_id: imagenette_res_cascade_v1
+checkpoint_dir: checkpoints
+num_workers: 8       # DataLoader workers (we have 30 CPUs); keeps the GPUs fed
+data_parallel: true  # split each batch across all visible GPUs (nn.DataParallel)
+
+train:
+  pretrained: true   # load ImageNet weights, replace head -> fine-tune
+  epochs: 30         # max epochs; training stops early on val-accuracy plateau
+  batch_size: 64     # split across GPUs by DataParallel (e.g. 16/GPU on 4x T4 @ 448px)
+  lr: 0.001
+  patience: 8        # stop after this many epochs with no val-accuracy improvement
+
+probe:
+  resolution: 96     # probe runs on a cheap low-res view of the input
+  z_dim: 128
+  epochs: 40
+  batch_size: 64
+  lr: 0.001
+  cls_weight: 0.1    # weight on the auxiliary classification CE head; kept small
+                     # so the route-safety BCE (the head routing actually uses)
+                     # drives the embedding instead of being swamped by it
+  weight_decay: 0.01 # AdamW L2 regularization to curb probe overfitting
+
+routing:
+  # Thresholds tau_k are calibrated, not hand-set: per cheap route we pick the
+  # most aggressive tau whose binomial upper confidence bound on harmful
+  # routing stays <= epsilon. Test-time rule: choose fk if s_k(x) >= tau_k,
+  # else fall through; else fM.
+  epsilon: 0.05        # target harmful-routing risk tolerance
+  delta: 0.05          # 1 - delta = confidence level of the upper bound (95%)
+
+cascade:
+  f1:
+    backbone: resnet50
+    resolution: 112
+
+  f2: 
+    backbone: resnet50
+    resolution: 224
+
+  f3: 
+    backbone: resnet50
+    resolution: 448

@@ -1,0 +1,39 @@
+# Imagenette-C: the cascade is built AND evaluated on corrupted images (one
+# corruption + severity applied to every image, at native resolution before the
+# per-stage resize). Tests how routing behaves under distribution shift -- expect
+# higher cheap-route harm rates and more traffic escalating to f3.
+# Sweep by copying this file with different `corruption` / `severity` values;
+# corruptions: gaussian_noise shot_noise impulse_noise gaussian_blur defocus_blur
+#              brightness contrast pixelate jpeg_compression   (severity 1..5)
+dataset: imagenette_c
+corruption: gaussian_noise
+severity: 3
+cascade_id: imagenette_c_gaussian_noise_s3_v1
+checkpoint_dir: checkpoints
+num_workers: 8
+data_parallel: true
+
+train:
+  pretrained: true
+  epochs: 30
+  batch_size: 64
+  lr: 0.001
+  patience: 8
+
+probe:
+  resolution: 96
+  z_dim: 128
+  epochs: 40
+  batch_size: 64
+  lr: 0.001
+  cls_weight: 0.1
+  weight_decay: 0.01
+
+routing:
+  epsilon: 0.05
+  delta: 0.05
+
+cascade:
+  f1: {backbone: resnet50, resolution: 112}
+  f2: {backbone: resnet50, resolution: 224}
+  f3: {backbone: resnet50, resolution: 448}

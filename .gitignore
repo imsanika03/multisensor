@@ -1,0 +1,17 @@
+# Data — too large for git (tarballs, tensors, extracted tiffs, cached embeddings)
+data/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pth
+*.pt
+
+# Checkpoints
+checkpoints/
+
+# OS
+.DS_Store

@@ -1,0 +1,30 @@
+dataset: imagewoof   # 10 hard-to-distinguish dog breeds (fine-grained ImageNet subset)
+cascade_id: imagewoof_res_cascade_v1
+checkpoint_dir: checkpoints
+num_workers: 8
+data_parallel: true
+
+train:
+  pretrained: true
+  epochs: 30
+  batch_size: 64
+  lr: 0.001
+  patience: 8
+
+probe:
+  resolution: 96
+  z_dim: 128
+  epochs: 40
+  batch_size: 64
+  lr: 0.001
+  cls_weight: 0.1
+  weight_decay: 0.01
+
+routing:
+  epsilon: 0.05
+  delta: 0.05
+
+cascade:
+  f1: {backbone: resnet50, resolution: 112}
+  f2: {backbone: resnet50, resolution: 224}
+  f3: {backbone: resnet50, resolution: 448}
