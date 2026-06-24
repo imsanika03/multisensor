@@ -4,9 +4,12 @@ Reads the 12 band-tiffs per patch (10m: B02/03/04/08 @120; 20m: B05/06/07/8A/11/
 @60; 60m: B01/09 @20), bilinearly resamples each to 120x120, stacks to [12,120,120].
 Saves X (uint16) + Y (19-way multi-hot) + split. Run after extraction.
 
-Run:  python ben_prep.py
+Run:
+  python ben_prep.py                                          # original 40k subset
+  python ben_prep.py --subset data/ben/standard_subset.json --out data/ben/ben_standard.pt
 """
 import json
+import sys
 import numpy as np
 import tifffile
 import torch
@@ -29,7 +32,14 @@ def load_patch(pid):
 
 
 def main():
-    d = json.load(open("data/ben/subset.json"))
+    subset_path = "data/ben/subset.json"
+    out_path    = "data/ben/ben_subset.pt"
+    if "--subset" in sys.argv:
+        subset_path = sys.argv[sys.argv.index("--subset") + 1]
+    if "--out" in sys.argv:
+        out_path = sys.argv[sys.argv.index("--out") + 1]
+
+    d = json.load(open(subset_path))
     pids = list(d["patches"].keys())
     N = len(pids)
     X = torch.zeros(N, 12, 120, 120, dtype=torch.float16)
@@ -44,9 +54,8 @@ def main():
         for c in d["patches"][pid]["y"]:
             Y[i, c] = 1
         split.append(d["patches"][pid]["split"])
-    torch.save({"X": X, "Y": Y, "split": split, "pids": pids, "vocab": d["vocab"]},
-               "data/ben/ben_subset.pt")
-    print(f"saved data/ben/ben_subset.pt  X={tuple(X.shape)}  Y={tuple(Y.shape)}")
+    torch.save({"X": X, "Y": Y, "split": split, "pids": pids, "vocab": d["vocab"]}, out_path)
+    print(f"saved {out_path}  X={tuple(X.shape)}  Y={tuple(Y.shape)}")
 
 
 if __name__ == "__main__":

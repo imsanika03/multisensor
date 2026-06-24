@@ -232,37 +232,6 @@ After step 4 you can delete `S2.tar.gz*` (61 GB) and `data/ben/x/` (7 GB) — `b
 
 ---
 
-## 9. Architecture detail — what sits on top of frozen DINOv2
-
-**Step 1: Frozen DINOv2 extracts RGB semantics.**
-RGB bands (B04, B03, B02) → frozen `dinov2_vitb14` → 768-dim CLS token. Precomputed once, cached as
-`data/ben/dino_cls.pt`. DINOv2 never trains, never sees non-RGB bands.
-
-**Step 2: SpectralEnc — the trainable adapter (~0.1–0.2M params).**
-For each of the 12 Sentinel-2 bands:
-1. *Patch embed* — 64×64 band image split into 4×4 patches → 16×16 grid = 256 spatial tokens (16-dim each)
-   → linear projection to 128-dim.
-2. *Wavelength conditioning* — sinusoidal embedding of the band's physical wavelength (e.g. 705nm for B05)
-   → small MLP → 128-dim. **Cross-sensor key:** the adapter knows *what wavelength* each band is, not just
-   which slot it occupies.
-3. *Fuse* — band embedding + wavelength conditioning concatenated → 2-layer MLP → 128-dim per spatial token
-   per band.
-4. *Masked mean over bands* — average over whichever bands are present (composition-invariant; handles missing
-   bands at test time). Result: [256 spatial tokens × 128-dim].
-5. *Conv spatial encoder* — reshape 256 tokens → 16×16 grid → two Conv2d layers → global avg pool → 128-dim.
-
-**Step 3: Late fusion + head.**
-128-dim spectral vector concat with 768-dim DINOv2 CLS → 896-dim → MLP → 19-class multi-label output.
-
-```
-DINOv2 CLS (768d, frozen) ─────────────────────────────────┐
-                                                            concat → MLP → labels
-SpectralEnc (128d, trainable):                             │
-  bands → patch embed → [+ wavelength MLP] → fuse         │
-        → masked mean over bands                           │
-        → conv 16×16 → global avg pool ───────────────────┘
-```
-
 **Why wavelength enables cross-sensor generalization.**
 Index conditioning learns "slot 4 means X" — fails on a new sensor where slot 4 is a different band.
 Wavelength conditioning learns "705nm means X" — a new sensor's 710nm band gets a nearly identical embedding,
@@ -301,3 +270,159 @@ Key findings:
 - Wavelength beats index when dropout is on (+1.0 pt, low std vs high std). Claim is robust.
 - Conv spatial encoder ≈ mean-pool on GAIN alone; conv advantage shows in XSENS stability.
 - nodrop variants score *higher* on GAIN (full 12 bands always present at test) — expected, not a contradiction.
+
+---
+
+## 11. MESA Architecture Results — BigEarthNet official 10% splits (macro-mAP)
+
+**Benchmark:** official BigEarthNet-S2 v1 splits, 10% training subset (26,969 train / 125,866 test), 19-class
+multi-label, macro-mAP. Scripts in `/lambda/nfs/sanikabhar-texas/multisensor/`.
+
+**Working directory:** `/lambda/nfs/sanikabhar-texas/multisensor/`
+(also accessible as `/home/ubuntu/sanikabhar-texas/multisensor` — same filesystem)
+
+**Data files (all present):**
+- `data/ben/ben_v1.pt` — X=(152835,12,120,120) f16, Y=(152835,19). Raw reflectance ÷3000 to normalize.
+- `data/ben/dino_cls_v1.pt` — [152835,768] float32, cached frozen DINOv2 CLS tokens.
+- `data/ben/dino_patches_v1.pt` — [152835,256,768] float16, ~60 GB. **Do not call `.float().mean(1)` directly — OOM. Use chunked loop (2000 at a time).**
+
+**Frozen backbone:** DINOv2 ViT-B/14, 86.58M params, ALL weights frozen throughout. This is a hard constraint.
+
+**GPU:** A100 80GB (or similar). No OOM risk at BS=256 for v4. `sqa` tmux session is the standard run session.
+
+### Baselines (cached DINOv2 features)
+| Model | mAP |
+|---|---|
+| CLS linear-probe | 63.41% |
+| CLS + patch-mean linear-probe | 64.36% |
+
+---
+
+### MESA architecture history and results
+
+**MESA-v1** (`ben_mesa_mid.py`): SpectralGatedAdapter, **global** spectral gating, blocks 9–11 only.
+- D_BOTTLE=64, D_SUMM=256, K=16 knots, BS=256, LR=2e-3, EPOCHS=100, ASL loss
+- seed 0: **68.40%** | seed 1: **68.00%**
+- *Limitation:* global gating applied the same spectral correction to all 257 tokens — no spatial specificity.
+
+**MESA-v2** (`ben_mesa_v2.py`): PerLocGatedAdapter, **per-location** spectral gating, blocks 6–11. **BEST CONFIRMED RESULT.**
+- D_BOTTLE=128, D_SPEC=128, D_SUMM=256, K=16 knots, BS=256, LR=2e-3, EPOCHS=100, ASL loss
+- Patch token j gated by `local_feat[:,j,:]` (spectrally-aligned correction per location)
+- CLS token gated by global spectral summary
+- seed 0: **70.65%** | seed 1: **71.12%**
+- 3.48M trainable params / 90.06M total (rest frozen)
+- *(Run stopped after 2 seeds to pursue v4. If v4 doesn't beat 70.65%, run 5 seeds on v2.)*
+
+**MESA-v4-attempt-1** (`ben_mesa_v3.py` / first v4 attempt): spectral tokens **inside** frozen DINOv2 attention.
+- K=8 spectral tokens inserted into 257-token sequence at block 6 → expanded to 265 tokens through blocks 6–11
+- Tokens participate in DINOv2's native frozen self-attention
+- seed 0: **69.59%** ← WORSE than v2
+- *Root cause:* frozen attention weights are trained for 257 tokens. 8 extra tokens absorb attention weight that
+  should go to RGB patches, diluting spatial reasoning. Frozen softmax normalizes over 265 instead of 257.
+
+**MESA-v4-attempt-2** (second v4 attempt, `ben_mesa_v4.py` before fix): unconstrained bidirectional cross-attn post-block.
+- Spectral tokens evolve separately (not inside frozen attention — this part correct)
+- Patch update via unconstrained cross-attention after each frozen block
+- seed 0: **16.95%** ← random prediction (≈ mean class prevalence)
+- *Root cause:* zero-init on output projection starts corrections at 0, but gradient immediately pushes p_o to grow.
+  Without bounding, corrections become >> DINOv2 features by epoch ~10. Model learns degenerate constant-output.
+  Fix: sigmoid gating (same bounded mechanism as v2).
+
+---
+
+### CURRENT VERSION TO RUN: MESA-v4 sigmoid-gated bidir (`ben_mesa_v4.py`)
+
+**Status: NOT YET RUN TO COMPLETION.** Training was killed at epoch 20/100. No result obtained.
+
+**Architecture:**
+- MESASummarizer: S2 bands → canonical coefficients (physics A/M matrices, K=16 Gaussian SRF knots,
+  420–2200nm) → spatial conv encoder (16×16) + ND ratio features → local_feat [B,256,128] + global_summ [B,256]
+- SpectralRegInit: K=8 learned spectral regime tokens shifted by global scene offset → [B, K, 768]
+- BidirSpectralLayer (one per adapted block, 6 total covering blocks 6–11):
+  - Step 1 — spec ← patches: spec tokens query DINOv2 patches via cross-attn [K×256, d_bidir=64], zero-init s_o
+    (safe: spec is auxiliary, no risk of corrupting backbone features)
+  - Step 2 — patches ← evolved spec: each patch soft-attends to K=8 spec tokens → per-patch spec context [B,256,768].
+    Then SIGMOID-GATED adapter: gate=sigmoid(W_gate @ spec_ctx) bounds correction ∈ [0,1], zero-init p_up.
+    This is the same stability mechanism as v2 — sigmoid gate prevents feature swamping.
+- Head: CLS + patch_mean → Linear(768+768→512) → GELU → Dropout(0.2) → Linear(512→19)
+- K_REG=8, D_BIDIR=64, D_BOTTLE=128, N_ADAPT_START=6
+- BS=256, LR=2e-3, EPOCHS=100, WARMUP=5, SEEDS=[0]
+
+**Why this should beat v2:**
+v2 patches are gated by STATIC local_feat from MESASummarizer (same spectral features across all 6 adapted blocks).
+v4 patches are gated by EVOLVED spec tokens — after 6 bidir rounds, spec tokens have absorbed DINOv2's intermediate
+representations and reflect both spectral AND spatial context. Gate is informed by richer, scene-adapted state.
+
+**Different from SpectraDINO (arxiv 2605.02258):**
+- SpectraDINO: per-modality bottleneck adapters, multi-stage training (cosine distillation + contrastive + patch alignment)
+- MESA: physics-based A/M matrices (Gaussian SRF overlaps → regularized inversion), K=8 spectral regime tokens that
+  evolve bidirectionally, sigmoid-gated adapter for stability. End-to-end ASL training, no distillation.
+
+**Run command (in `sqa` tmux session):**
+```bash
+cd /lambda/nfs/sanikabhar-texas/multisensor
+python3 ben_mesa_v4.py 2>&1 | tee results/ben_mesa_v4.log
+```
+Expected: ~45 min on A100 for 100 epochs / 1 seed. Output: `results/ben_mesa_v4.json`.
+
+**Decision tree after v4 finishes:**
+- v4 seed 0 > 70.65% (v2 seed 0): v4 is better → run 5 seeds on v4 for the paper table
+- v4 seed 0 < 70.65%: v4 does not beat v2 → fall back to v2 as the paper method, run 5 seeds on v2
+
+---
+
+### Complete results table
+
+| Version | Architecture | mAP (seed 0) | mAP (seed 1) | Status |
+|---|---|---|---|---|
+| Linear probe (CLS) | Frozen DINOv2 features | 63.41% | — | baseline |
+| Linear probe (CLS+patches) | Frozen DINOv2 features | 64.36% | — | baseline |
+| MESA-v1 | Global spectral gate, blocks 9–11 | 68.40% | 68.00% | done |
+| MESA-v2 | Per-loc spectral gate, blocks 6–11 | 70.65% | 71.12% | **BEST — 2 seeds** |
+| MESA-v4-a1 | Tokens inside frozen attn | 69.59% | — | killed (worse than v2) |
+| MESA-v4-a2 | Bidir unbounded cross-attn | 16.95% | — | killed (degenerate) |
+| **MESA-v4** | **Bidir sigmoid-gated (current)** | **NOT YET RUN** | — | **← RUN THIS NEXT** |
+
+---
+
+### Key architecture progression
+```
+MESA-v1: spectral_summary [B,256]  → same gate for all 257 tokens        → 68.2% avg
+MESA-v2: local_feat [B,256,128]    → per-location gate for token j       → ~70.9% (seeds 0-1) ← BEST
+MESA-v4-a1: K=8 tokens inside attn → dilutes frozen attention             → 69.59%
+MESA-v4-a2: bidir, unbounded       → corrections swamp DINOv2 features   → 16.95% (random)
+MESA-v4:  bidir, sigmoid-gated     → bounded, evolved spec context       → NOT YET RUN
+```
+
+---
+
+### MESA implementation notes (avoid repeating these mistakes)
+- **Zero-init on adapter output projections** (`up.weight`, `up.bias`, `s_o.weight`, `s_o.bias`) — ensures model
+  starts as frozen DINOv2, learns additive corrections. Miss this and training diverges from LP baseline.
+- **Sigmoid gating is essential for patch updates** — any unbounded cross-attention correction for patch tokens will
+  swamp DINOv2 features (v4-a2 failure). Spec tokens can be updated freely (they are auxiliary).
+- **Do NOT insert spectral tokens into frozen DINOv2 attention** — frozen weights are trained for 257 tokens; extra
+  tokens dilute spatial attention (v4-a1 failure at 69.59%).
+- **Detach after block 5** (`x = x.detach()`) — gradient flows only through adapters + MESASummarizer.
+- **Consistent spatial augmentation** — flip rgb AND x_loc together (x_loc reshaped as [16,16,12] → flip → [256,12]).
+- **OOM on patch cache:** `dino_patches_v1.pt` [152835,256,768] f16 ≈ 60 GB. `.float()` doubles to 120 GB → OOM.
+  Use chunked loop: `for i in range(0, len(PAT), 2000): chunks[i:i+2000] = PAT[i:i+2000].float().mean(1)`.
+- **ASL loss** (γ_neg=4, γ_pos=0, margin=0.05) outperforms BCE for multi-label with class imbalance.
+- **LR=2e-3, WARMUP=5** — confirmed working. Do not increase WARMUP (WARMUP=10 caused collapse).
+- **FiLM adapters are off-limits** — another paper already uses FiLM for this; MESA must be architecturally distinct.
+
+---
+
+### Paper comparison baselines
+| Method | mAP | Notes |
+|---|---|---|
+| CLS linear-probe | 63.41% | frozen DINOv2, cached |
+| CLS+patch linear-probe | 64.36% | frozen DINOv2, cached |
+| SatMAE++ ViT-L | 85.10% | RS-pretrained + full FT |
+| SMARTIES ViT-B | 86.90% | RS-pretrained + full FT |
+| CROMA ViT-B | 87.60% | RS-pretrained + full FT |
+| **MESA-v2 (ours)** | **~70.9%** | Frozen DINOv2, 2 seeds |
+| **MESA-v4 (ours)** | **TBD** | Frozen DINOv2, needs run |
+
+Note: the RS-pretrained methods use full fine-tuning and RS-domain pretraining; MESA's claim is that a frozen
+ImageNet model + physics-based spectral adapter reaches competitive accuracy without any RS pretraining.
