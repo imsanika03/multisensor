@@ -1,33 +1,11 @@
-"""MESA-v4 (v2): Bidirectional spectral register tokens with gated patch update.
+"""MESA-v4-local: Bidir spec tokens, but patch gate uses per-location local_feat (not spec_ctx).
 
-Failure analysis of v4-original (69.59%) and v4-fixed (16.95%):
-  v4-original: spectral tokens INSIDE frozen DINOv2 attention → dilutes spatial attention
-  v4-fixed:    unbounded bidir cross-attn for patch update → correction swamps DINOv2
-               features, model outputs constant prediction for all samples (~16% = random)
+Hypothesis test: v4 (69.78%) underperforms v2 (70.65%) because K=8 spec tokens
+globally aggregate spectral info before gating patches. For multi-label scenes with
+spatially-distinct land covers, per-location spectral features should gate better.
 
-Root cause of v4-fixed failure:
-  Zero-init output projection starts patch corrections at 0, but the gradient
-  pushes p_o to grow fast. Without bounding, corrections become >> DINOv2 features.
-  Model learns a degenerate solution: constant output regardless of input.
-
-This fix:
-  - spec ← patches: small cross-attention (spec updates from DINOv2 patches, zero-init out)
-    Safe: spec tokens are auxiliary, no risk of corrupting frozen backbone features.
-  - patches ← spec: SIGMOID-GATED adapter (same mechanism as v2, bounded by design)
-    Each patch token attends softly to K=8 evolved spec tokens → per-patch spec context.
-    Gate = sigmoid(W_gate @ spec_context) bounds correction to [0,1] scale.
-    Zero-init output projection.
-
-Why this beats v2:
-  v2: patches gated by STATIC local_feat from MESASummarizer (same across all 6 blocks)
-  v4: patches gated by EVOLVED spec_tokens — after 6 bidir rounds, spec tokens have
-      absorbed DINOv2's intermediate representations and reflect both spectral AND
-      spatial context. The gate is informed by a richer, scene-adapted spectral state.
-
-Different from SpectraDINO:
-  - Physics A/M matrices (Gaussian SRF overlaps → regularized inversion)
-  - K=8 spectral regime tokens that evolve bidirectionally across blocks
-  - Sigmoid-gated adapter ensures stability while allowing bidirectional learning
+Change vs v4: p_gate input = local_feat (B,256,128) instead of spec_ctx (B,256,768).
+Spec tokens still evolve bidirectionally (spec<-patches), but don't feed the patch gate.
 """
 import json, math, os
 import torch
@@ -56,15 +34,15 @@ K_KNOTS = len(KNOTS)
 # Hyperparameters
 # ---------------------------------------------------------------------------
 BS             = 256
-LR             = 2e-3
-EPOCHS         = 100
+LR             = 5e-4
+EPOCHS         = 50
 WARMUP         = 5
 SEEDS          = [0]
 D_SPEC         = 128
 D_SUMM         = 256
 N_ND           = 16
 K_REG          = 8       # spectral register tokens
-D_BIDIR        = 64      # bottleneck for spec←patches cross-attn
+D_BIDIR        = 64      # bottleneck for spec<-patches cross-attn
 D_BOTTLE       = 128     # bottleneck for gated patch adapter (same as v2)
 N_ADAPT_START  = 6
 
@@ -172,13 +150,13 @@ class SpectralRegInit(nn.Module):
 class BidirSpectralLayer(nn.Module):
     """Two-step update:
 
-    Step 1 — spec ← patches  (spec reads DINOv2 patch context):
-      Small cross-attention [K×256], zero-init output → safe, no patch corruption.
+    Step 1 -- spec <- patches  (spec reads DINOv2 patch context):
+      Small cross-attention [K×256], zero-init output -> safe, no patch corruption.
       Spec tokens evolve to reflect what DINOv2 sees in this scene.
 
-    Step 2 — patches ← spec  (patches read evolved spec tokens):
-      Each patch soft-attends to K=8 spec tokens → per-patch spectral context [B,256,768].
-      Then GATED adapter (sigmoid bounded, zero-init up) — same stability as v2.
+    Step 2 -- patches <- spec  (patches read evolved spec tokens):
+      Each patch soft-attends to K=8 spec tokens -> per-patch spectral context [B,256,768].
+      Then GATED adapter (sigmoid bounded, zero-init up) -- same stability as v2.
       Gate = sigmoid(W_gate @ spec_context) bounds correction to [0, 1] × feature scale.
 
     This prevents the catastrophic failure of v4-fixed where unconstrained corrections
@@ -189,41 +167,36 @@ class BidirSpectralLayer(nn.Module):
         self.scale_spec = d_bidir ** -0.5
         self.scale_gate = dim    ** -0.5
 
-        # spec ← patches: cross-attention (spec queries, patches as K/V)
+        # spec <- patches: cross-attention (spec queries, patches as K/V)
         self.s_q = nn.Linear(dim, d_bidir, bias=False)
         self.s_k = nn.Linear(dim, d_bidir, bias=False)
         self.s_v = nn.Linear(dim, d_bidir, bias=False)
         self.s_o = nn.Linear(d_bidir, dim)
         nn.init.zeros_(self.s_o.weight); nn.init.zeros_(self.s_o.bias)
 
-        # patches ← spec: per-patch spec context via soft-attention over K tokens,
-        # then sigmoid-gated adapter
-        self.p_gate = nn.Linear(dim, d_bottle)   # spec_context → sigmoid gate
-        self.p_down = nn.Linear(dim, d_bottle)   # patch_token → bottleneck
-        self.p_up   = nn.Linear(d_bottle, dim)   # bottleneck → correction (zero-init)
+        # patches <- local_feat: per-location gate from MESASummarizer (D_SPEC dim)
+        self.p_gate = nn.Linear(D_SPEC, d_bottle)  # local_feat -> sigmoid gate
+        self.p_down = nn.Linear(dim, d_bottle)     # patch_token -> bottleneck
+        self.p_up   = nn.Linear(d_bottle, dim)     # bottleneck -> correction (zero-init)
         nn.init.zeros_(self.p_up.weight); nn.init.zeros_(self.p_up.bias)
 
-    def forward(self, x, spec):
-        # x:    [B, 257, 768]
-        # spec: [B, K, 768]
+    def forward(self, x, spec, local_feat):
+        # x:          [B, 257, 768]
+        # spec:       [B, K, 768]
+        # local_feat: [B, 256, D_SPEC]  -- per-location spectral features (static)
         patches = x[:, 1:]                                                 # [B, 256, 768]
 
-        # --- Step 1: spec reads from DINOv2 patches ---
-        q = self.s_q(spec)                                                 # [B, K, d_bidir]
-        k = self.s_k(patches)                                              # [B, 256, d_bidir]
-        v = self.s_v(patches)                                              # [B, 256, d_bidir]
-        spec_attn = F.softmax(q @ k.transpose(-2, -1) * self.scale_spec, dim=-1)  # [B, K, 256]
-        spec = spec + self.s_o(spec_attn @ v)                             # residual, zero-init s_o
+        # --- Step 1: spec reads from DINOv2 patches (unchanged) ---
+        q = self.s_q(spec)
+        k = self.s_k(patches)
+        v = self.s_v(patches)
+        spec_attn = F.softmax(q @ k.transpose(-2, -1) * self.scale_spec, dim=-1)
+        spec = spec + self.s_o(spec_attn @ v)
 
-        # --- Step 2: patches read from evolved spec (bounded by sigmoid gate) ---
-        # Per-patch spectral context: each patch soft-attends to K spec tokens
-        gate_attn = F.softmax(patches @ spec.transpose(-2, -1) * self.scale_gate, dim=-1)  # [B, 256, K]
-        spec_ctx  = gate_attn @ spec                                       # [B, 256, 768]
-
-        # Gated adapter (sigmoid-bounded, zero-init up → starts as identity)
-        g = torch.sigmoid(self.p_gate(spec_ctx))                          # [B, 256, d_bottle]
+        # --- Step 2: patches gated by per-location local_feat (not spec_ctx) ---
+        g = torch.sigmoid(self.p_gate(local_feat))                        # [B, 256, d_bottle]
         h = F.gelu(self.p_down(patches))                                  # [B, 256, d_bottle]
-        patches = patches + self.p_up(h * g)                             # [B, 256, 768]
+        patches = patches + self.p_up(h * g)                              # [B, 256, 768]
 
         return torch.cat([x[:, :1], patches], dim=1), spec
 
@@ -249,7 +222,7 @@ class MESAv4Model(nn.Module):
         self.bidir_layers = nn.ModuleList([BidirSpectralLayer() for _ in range(n_adapted)])
 
         self.head = nn.Sequential(
-            nn.Linear(768 + 768, 512), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(768 + 768, 512), nn.GELU(), nn.Dropout(0.3),
             nn.Linear(512, nc),
         )
 
@@ -259,7 +232,7 @@ class MESAv4Model(nn.Module):
         return self
 
     def forward(self, rgb, x_loc):
-        _, global_summ = self.summarizer(x_loc)
+        local_feat, global_summ = self.summarizer(x_loc)                  # local_feat: [B, 256, D_SPEC]
         spec = self.spec_reg(global_summ)                                  # [B, K, 768]
 
         with torch.no_grad():
@@ -269,8 +242,8 @@ class MESAv4Model(nn.Module):
         x = x.detach()
 
         for i, blk in enumerate(self.dino.blocks[N_ADAPT_START:]):
-            x = blk(x)                                                     # 257 tokens, no dilution
-            x, spec = self.bidir_layers[i](x, spec)
+            x = blk(x)
+            x, spec = self.bidir_layers[i](x, spec, local_feat)           # pass local_feat
 
         x   = self.dino.norm(x)
         cls = x[:, 0]
@@ -343,7 +316,7 @@ def train_eval(X, Y, tr, te, nc, seed):
     net   = MESAv4Model(nc).to(DEV)
     opt   = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, net.parameters()),
-        lr=LR, weight_decay=1e-4
+        lr=LR, weight_decay=5e-4
     )
     sched = cosine_with_warmup(opt, WARMUP, EPOCHS)
 
@@ -368,6 +341,11 @@ def train_eval(X, Y, tr, te, nc, seed):
         net.train()
         return macro_mAP(torch.cat(S), Y[torch.tensor(te)])
 
+    best_map   = 0.0
+    best_state = None
+    patience   = 3   # eval intervals (each = 10 epochs); stop after 30 epochs no improvement
+    no_improve = 0
+
     for ep in range(EPOCHS):
         net.train()
         ep_loss = 0.0
@@ -382,18 +360,25 @@ def train_eval(X, Y, tr, te, nc, seed):
             ep_loss += loss.item()
             n_batches += 1
         sched.step()
+
         if (ep + 1) % 10 == 0:
             val_map = eval_map()
-            print(f"    epoch {ep+1}/{EPOCHS}  loss={ep_loss/n_batches:.4f}  mAP={val_map*100:.2f}%", flush=True)
+            tag = ""
+            if val_map > best_map:
+                best_map   = val_map
+                best_state = {k: v.cpu().clone() for k, v in net.state_dict().items()}
+                no_improve = 0
+                tag = "  *best*"
+            else:
+                no_improve += 1
+                tag = f"  (no improvement {no_improve}/{patience})"
+            print(f"    epoch {ep+1}/{EPOCHS}  loss={ep_loss/n_batches:.4f}  mAP={val_map*100:.2f}%{tag}", flush=True)
+            if no_improve >= patience:
+                print(f"    early stopping at epoch {ep+1} — best mAP={best_map*100:.2f}%", flush=True)
+                break
 
-    net.eval()
-    S = []
-    with torch.no_grad():
-        for rgb, x_loc, _ in tel:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits = net(rgb.to(DEV), x_loc.to(DEV))
-            S.append(torch.sigmoid(logits).float().cpu())
-    return macro_mAP(torch.cat(S), Y[torch.tensor(te)])
+    net.load_state_dict(best_state)
+    return best_map
 
 
 # ---------------------------------------------------------------------------
@@ -403,16 +388,16 @@ def train_eval(X, Y, tr, te, nc, seed):
 def main():
     torch.set_float32_matmul_precision("high")
 
-    print(f"MESA-v4: K_REG={K_REG}, D_BIDIR={D_BIDIR}, D_BOTTLE={D_BOTTLE}, "
+    print(f"MESA-v4-local: K_REG={K_REG}, D_BIDIR={D_BIDIR}, D_BOTTLE={D_BOTTLE}, "
           f"adapt_blocks={N_ADAPT_START}–11", flush=True)
-    print(f"  spec←patches: cross-attn [K×256], zero-init s_o", flush=True)
-    print(f"  patches←spec: soft-attn over K tokens → sigmoid-gated adapter, zero-init up", flush=True)
+    print(f"  spec<-patches: cross-attn [K×256], zero-init s_o", flush=True)
+    print(f"  patches gate: LOCAL per-location feat (D_SPEC={D_SPEC}), not spec_ctx", flush=True)
     print(f"Training: LR={LR}, BS={BS}, EPOCHS={EPOCHS}, warmup={WARMUP}", flush=True)
 
     data_path     = "data/ben/ben_v1.pt"
     cache_cls     = "data/ben/dino_cls_v1.pt"
     cache_patches = "data/ben/dino_patches_v1.pt"
-    out_path      = "results/ben_mesa_v4.json"
+    out_path      = "results/ben_mesa_v4_local.json"
 
     print(f"\nloading {data_path} ...", flush=True)
     d = torch.load(data_path, weights_only=False)
@@ -463,7 +448,8 @@ def main():
     print(f"  MESA-v2 (per-loc gate)                        : 70.65% / 71.12% [seeds 0-1]", flush=True)
     print(f"  MESA-v4-attempt1 (tokens in frozen attn)      : 69.59%  [attn dilution]", flush=True)
     print(f"  MESA-v4-attempt2 (bidir, unbounded)           : 16.95%  [feature swamping]", flush=True)
-    print(f"  MESA-v4 (bidir, sigmoid-gated patch update)   : {t.mean()*100:.2f}%", flush=True)
+    print(f"  MESA-v4       (bidir, global spec_ctx gate)    : 69.78%  [seed 0]", flush=True)
+    print(f"  MESA-v4-local (bidir, local_feat gate)        : {t.mean()*100:.2f}%", flush=True)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ Run: python ben_v1_prep.py
 """
 import json
 import glob
+import os
 import numpy as np
 import tifffile
 import torch
@@ -57,9 +58,14 @@ def load_patch(pid):
     return torch.stack(arrs)   # [12, 120, 120]
 
 
-def load_label(pid):
-    j = glob.glob(f"{ROOT}/{pid}/*_labels_metadata.json")[0]
-    labels = json.load(open(j))["labels"]
+def load_label(args):
+    pid, label_map = args
+    # Prefer per-patch JSON if it was extracted, otherwise use pre-built map
+    local = glob.glob(f"{ROOT}/{pid}/*_labels_metadata.json")
+    if local:
+        labels = json.load(open(local[0]))["labels"]
+    else:
+        labels = label_map.get(pid, [])
     idxs43 = [CLASS2IDX[l] for l in labels if l in CLASS2IDX]
     idxs19 = list({LABEL_CONV[i] for i in idxs43 if i in LABEL_CONV})
     y = torch.zeros(NC)
@@ -74,16 +80,33 @@ def main():
     split = [d["patches"][p]["split"] for p in pids]
     N     = len(pids)
 
-    X = torch.zeros(N, 12, 120, 120, dtype=torch.float16)
-    with ThreadPoolExecutor(max_workers=32) as ex:
-        for i, arr in enumerate(ex.map(load_patch, pids)):
-            X[i] = arr.half()
-            if i % 5000 == 0:
-                print(f"  images {i}/{N}", flush=True)
+    # Load pre-built S2 label map (extracted from S1 tarball)
+    label_map_path = "data/ben/s2_label_map.json"
+    if os.path.exists(label_map_path):
+        label_map = json.load(open(label_map_path))
+        print(f"  loaded label map: {len(label_map)} entries", flush=True)
+    else:
+        label_map = {}
+        print("  WARNING: label map not found, falling back to per-patch JSONs", flush=True)
+
+    X_ckpt = "data/ben/ben_v1_X.pt"
+    if os.path.exists(X_ckpt):
+        print(f"  loading X from checkpoint {X_ckpt}", flush=True)
+        X = torch.load(X_ckpt)
+    else:
+        X = torch.zeros(N, 12, 120, 120, dtype=torch.float16)
+        with ThreadPoolExecutor(max_workers=32) as ex:
+            for i, arr in enumerate(ex.map(load_patch, pids)):
+                X[i] = arr.half()
+                if i % 5000 == 0:
+                    print(f"  images {i}/{N}", flush=True)
+        torch.save(X, X_ckpt)
+        print(f"  saved X checkpoint {X_ckpt}", flush=True)
 
     Y = torch.zeros(N, NC)
+    args_list = [(pid, label_map) for pid in pids]
     with ThreadPoolExecutor(max_workers=32) as ex:
-        for i, y in enumerate(ex.map(load_label, pids)):
+        for i, y in enumerate(ex.map(load_label, args_list)):
             Y[i] = y
             if i % 5000 == 0:
                 print(f"  labels {i}/{N}", flush=True)
